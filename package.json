@@ -1,0 +1,46 @@
+{
+  "name": "civicresolve",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "backend": "node backend/server.js",
+    "dev:all": "concurrently -n backend,frontend -c blue,green \"npm run backend\" \"npm run dev\"",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^1.44.0",
+    "@supabase/supabase-js": "^2.103.0",
+    "@types/leaflet": "^1.9.21",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "leaflet": "^1.9.4",
+    "lowdb": "^7.0.1",
+    "lucide-react": "^0.556.0",
+    "nodemailer": "^8.0.4",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "react-leaflet": "^5.0.0",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "twilio": "^5.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.0.0",
+    "autoprefixer": "^10.4.27",
+    "concurrently": "^9.2.1",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^3.4.3",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}
