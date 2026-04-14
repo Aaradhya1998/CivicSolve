@@ -143,7 +143,5 @@ Core backend endpoints:
 3. Add Supabase keys to `.env`.
 4. Restart backend and confirm `/api/health` reports Supabase DB readiness.
 
-## License
 
-Add your preferred license (MIT/Apache-2.0/etc.) before distribution.
 
