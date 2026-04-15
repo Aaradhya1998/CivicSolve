@@ -19,6 +19,7 @@ export const copy: Record<LanguageCode, Record<string, string>> = {
     map: "Map",
     track: "Track",
     community: "Community",
+    admin: "Admin",
     assistant: "Help",
     signIn: "Sign In",
     register: "Register",

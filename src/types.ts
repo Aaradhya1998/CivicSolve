@@ -5,6 +5,7 @@ export enum Tab {
   TRACK = "track",
   COMMUNITY = "community",
   ASSISTANT = "assistant",
+  ADMIN = "admin",
   PROFILE = "profile",
 }
 
@@ -39,6 +40,7 @@ export type AuthUser = {
   lastLoginAt?: string;
   emailVerified: boolean;
   phoneVerified: boolean;
+  isAdmin?: boolean;
 };
 
 export type AuthSession = {
@@ -148,4 +150,17 @@ export type ProfileSummary = {
   complaints: ComplaintRecord[];
   stats: ProfileStats;
   contributions: ContributionPoint[];
+};
+
+export type AdminOverview = {
+  totals: {
+    complaints: number;
+    resolved: number;
+    open: number;
+    withPhoto: number;
+    mapped: number;
+  };
+  byStatus: Array<{ label: ComplaintStatus; count: number }>;
+  byCategory: Array<{ label: string; count: number }>;
+  complaints: ComplaintRecord[];
 };

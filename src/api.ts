@@ -1,5 +1,5 @@
 import { io, type Socket } from "socket.io-client";
-import { AuthSession, ComplaintRecord, CivicInsight, LanguageCode, OtpChannel, OtpDelivery, ProfileSummary } from "./types";
+import { AdminOverview, AuthSession, ComplaintRecord, CivicInsight, LanguageCode, OtpChannel, OtpDelivery, ProfileSummary } from "./types";
 
 const apiBaseUrl = (((import.meta as any).env?.VITE_API_BASE_URL as string | undefined) ?? "").replace(/\/$/, "");
 const socketBaseUrl =
@@ -42,6 +42,13 @@ export const api = {
     request<AuthSession>("/api/auth/register", { method: "POST", body: JSON.stringify(payload) }),
   login: (payload: { identifier: string; password: string }) =>
     request<AuthSession>("/api/auth/login", { method: "POST", body: JSON.stringify(payload) }),
+  requestForgotPasswordOtp: (email: string) =>
+    request<OtpDelivery>("/api/auth/forgot-password/request", { method: "POST", body: JSON.stringify({ email }) }),
+  resetForgotPassword: (payload: { email: string; code: string; newPassword: string }) =>
+    request<{ ok: boolean; message: string }>("/api/auth/forgot-password/reset", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   me: (token: string) => request<{ user: AuthSession["user"] }>("/api/auth/me", {}, token),
   updateProfile: (payload: { language?: LanguageCode; name?: string; phone?: string }, token: string) =>
     request<{ user: AuthSession["user"] }>("/api/auth/me", { method: "PATCH", body: JSON.stringify(payload) }, token),
@@ -54,6 +61,13 @@ export const api = {
     request<{ complaint: ComplaintRecord }>("/api/complaints", { method: "POST", body: JSON.stringify(payload) }, token),
   supportComplaint: (id: string, token: string) =>
     request<{ complaint: ComplaintRecord }>(`/api/complaints/${id}/support`, { method: "POST" }, token),
+  fetchAdminOverview: (token: string) => request<AdminOverview>("/api/admin/overview", {}, token),
+  updateComplaintStatus: (id: string, status: ComplaintRecord["status"], token: string) =>
+    request<{ complaint: ComplaintRecord }>(
+      `/api/admin/complaints/${id}/status`,
+      { method: "PATCH", body: JSON.stringify({ status }) },
+      token
+    ),
 };
 
 export function getComplaintSocket() {

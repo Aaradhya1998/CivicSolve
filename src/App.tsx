@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   Activity,
   ArrowRight,
+  Bot,
   FileText,
   Globe2,
   Languages,
@@ -11,16 +12,20 @@ import {
   LogOut,
   Map,
   Moon,
+  Shield,
+  Sparkles,
   Sun,
+  Send,
   UserRound,
   Users,
   type LucideIcon,
 } from "lucide-react";
 import { api, getComplaintSocket } from "./api";
-import { createComplaintDraft } from "./geminiService";
+import { chatWithCivicAssistant, createComplaintDraft } from "./geminiService";
 import { copy, languageOptions } from "./i18n";
-import { AuthSession, ComplaintDraft, ComplaintRecord, ComplaintStatus, IssueCategory, LanguageCode, OtpChannel, ProfileSummary, ReportForm, Tab } from "./types";
+import { AdminOverview, AuthSession, ChatMessage, ComplaintDraft, ComplaintRecord, ComplaintStatus, IssueCategory, LanguageCode, OtpChannel, ProfileSummary, ReportForm, Tab } from "./types";
 import { AuthFields, AuthModal, AuthMode } from "./components/AuthModal";
+import { AdminPanel } from "./components/AdminPanel";
 import { ComplaintCard } from "./components/ComplaintCard";
 import { ComplaintMap } from "./components/ComplaintMap";
 import { ProfilePanel } from "./components/ProfilePanel";
@@ -29,12 +34,13 @@ const sessionKey = "civicsolve_session_v1";
 const languageKey = "civicsolve_language_v1";
 const themeKey = "civicsolve_theme_v1";
 type Theme = "light" | "dark";
-const tabs: Array<{ id: Tab; label: keyof typeof copy.en; icon: LucideIcon }> = [
+const baseTabs: Array<{ id: Tab; label: keyof typeof copy.en; icon: LucideIcon }> = [
   { id: Tab.HOME, label: "home", icon: Globe2 },
   { id: Tab.REPORT, label: "report", icon: FileText },
   { id: Tab.MAP, label: "map", icon: Map },
   { id: Tab.TRACK, label: "track", icon: Activity },
   { id: Tab.COMMUNITY, label: "community", icon: Users },
+  { id: Tab.ASSISTANT, label: "assistant", icon: Bot },
   { id: Tab.PROFILE, label: "profile", icon: UserRound },
 ];
 const filters: Array<ComplaintStatus | "All"> = ["All", "Submitted", "In Review", "Assigned", "Resolved"];
@@ -91,16 +97,33 @@ export function App() {
   const [filter, setFilter] = useState<ComplaintStatus | "All">("All");
   const [authOpen, setAuthOpen] = useState(false);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
+  const [authIntent, setAuthIntent] = useState<"default" | "admin">("default");
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
-  const [authFields, setAuthFields] = useState<AuthFields>({ name: "", email: "", phone: "", password: "", language });
+  const [authFields, setAuthFields] = useState<AuthFields>({ name: "", email: "", phone: "", password: "", resetCode: "", language });
+  const [forgotOtpHint, setForgotOtpHint] = useState("");
+  const [forgotDevOtp, setForgotDevOtp] = useState("");
   const [accountForm, setAccountForm] = useState({ name: "", phone: "", language: "en" as LanguageCode });
   const [otpState, setOtpState] = useState<Record<OtpChannel, ReturnType<typeof emptyOtpState>>>({
     email: emptyOtpState(),
     phone: emptyOtpState(),
   });
+  const [assistantInput, setAssistantInput] = useState("");
+  const [assistantLoading, setAssistantLoading] = useState(false);
+  const [assistantMessages, setAssistantMessages] = useState<ChatMessage[]>([
+    {
+      role: "model",
+      text: "Hi, I can help with everyday civic issues you may solve yourself, like basic drain cleanup checks, power outage reporting steps, and safe escalation paths.",
+    },
+  ]);
+  const [adminOverview, setAdminOverview] = useState<AdminOverview | null>(null);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminUpdatingId, setAdminUpdatingId] = useState("");
 
   const lang = session?.user.language || language;
+  const tabs = session?.user?.isAdmin
+    ? [...baseTabs, { id: Tab.ADMIN, label: "admin", icon: Shield }]
+    : baseTabs;
   const strings = copy[lang] || copy.en;
   const t = (key: keyof typeof copy.en, fallback: string) => strings[key] || copy.en[key] || fallback;
   const visible = filter === "All" ? complaints : complaints.filter((item) => item.status === filter);
@@ -125,17 +148,37 @@ export function App() {
     } else {
       localStorage.removeItem(sessionKey);
       setProfile(null);
+      setAdminOverview(null);
       setAccountForm({ name: "", phone: "", language: language });
       setOtpState({ email: emptyOtpState(), phone: emptyOtpState() });
     }
   };
 
   const upsertComplaint = (next: ComplaintRecord) => setComplaints((current) => sortComplaints([next, ...current.filter((item) => item.id !== next.id)]));
-  const openAuth = (mode: AuthMode) => {
+  const openAuth = (mode: AuthMode, intent: "default" | "admin" = "default") => {
+    setAuthMode(mode);
+    setAuthIntent(intent);
+    setAuthError("");
+    setForgotOtpHint("");
+    setForgotDevOtp("");
+    setAuthFields((current) => ({
+      ...current,
+      language: lang,
+      phone: current.phone || session?.user.phone || "",
+      password: mode === "forgot" ? "" : current.password,
+      resetCode: "",
+    }));
+    setAuthOpen(true);
+  };
+
+  const handleAuthModeChange = (mode: AuthMode) => {
     setAuthMode(mode);
     setAuthError("");
-    setAuthFields((current) => ({ ...current, language: lang, phone: current.phone || session?.user.phone || "" }));
-    setAuthOpen(true);
+    if (mode !== "forgot") {
+      setForgotOtpHint("");
+      setForgotDevOtp("");
+      setAuthFields((current) => ({ ...current, resetCode: "" }));
+    }
   };
 
   async function refreshProfile(token = session?.token) {
@@ -227,6 +270,20 @@ export function App() {
     setAuthLoading(true);
     setAuthError("");
     try {
+      if (authMode === "forgot") {
+        await api.resetForgotPassword({
+          email: authFields.email.trim().toLowerCase(),
+          code: authFields.resetCode.trim(),
+          newPassword: authFields.password,
+        });
+        setAuthMode("login");
+        setAuthFields((current) => ({ ...current, password: "", resetCode: "" }));
+        setForgotOtpHint("");
+        setForgotDevOtp("");
+        setNote("Password reset successful. Sign in with your new password.");
+        return;
+      }
+
       const next =
         authMode === "register"
           ? await api.register(authFields)
@@ -235,16 +292,42 @@ export function App() {
         setAuthMode("login");
         setAuthOpen(false);
         setNote(next.message || "Account created. Confirm your email, then sign in.");
-        setAuthFields((current) => ({ ...current, password: "" }));
+        setAuthFields((current) => ({ ...current, password: "", resetCode: "" }));
         return;
       }
       syncSession(next);
       setAuthOpen(false);
       setNote(`Signed in as ${next.user.name}.`);
-      setAuthFields({ name: "", email: "", phone: "", password: "", language: next.user.language });
-      setTab(Tab.PROFILE);
+      setAuthFields({ name: "", email: "", phone: "", password: "", resetCode: "", language: next.user.language });
+      setForgotOtpHint("");
+      setForgotDevOtp("");
+      if (authIntent === "admin" && !next.user.isAdmin) {
+        setNote("Logged in, but this account is not an admin. Ask maintainer to add this email to ADMIN_EMAILS.");
+      }
+      setTab(next.user.isAdmin ? Tab.ADMIN : Tab.PROFILE);
+      setAuthIntent("default");
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed.");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function requestForgotOtp() {
+    const email = authFields.email.trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      setAuthError("Enter a valid email to receive OTP.");
+      return;
+    }
+    setAuthLoading(true);
+    setAuthError("");
+    try {
+      const delivery = await api.requestForgotPasswordOtp(email);
+      setForgotOtpHint(delivery.deliveryHint || email);
+      setForgotDevOtp(delivery.devOtp || "");
+      setNote(`Password reset OTP sent to ${delivery.deliveryHint || email}.`);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Could not send password reset OTP.");
     } finally {
       setAuthLoading(false);
     }
@@ -404,6 +487,55 @@ export function App() {
     }
   }
 
+  async function sendAssistantMessage() {
+    const message = assistantInput.trim();
+    if (!message || assistantLoading) return;
+    const history = [...assistantMessages, { role: "user" as const, text: message }];
+    setAssistantMessages(history);
+    setAssistantInput("");
+    setAssistantLoading(true);
+    try {
+      const reply = await chatWithCivicAssistant(history, message, lang);
+      setAssistantMessages((current) => [...current, { role: "model", text: reply }]);
+    } finally {
+      setAssistantLoading(false);
+    }
+  }
+
+  async function refreshAdmin(token = session?.token) {
+    if (!token || !session?.user?.isAdmin) return;
+    setAdminLoading(true);
+    try {
+      const data = await api.fetchAdminOverview(token);
+      setAdminOverview(data);
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : "Could not load admin dashboard.");
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function updateAdminComplaintStatus(id: string, status: ComplaintRecord["status"]) {
+    if (!session?.token) return;
+    setAdminUpdatingId(id);
+    try {
+      const { complaint } = await api.updateComplaintStatus(id, status, session.token);
+      upsertComplaint(complaint);
+      await refreshAdmin(session.token);
+      setNote(`Updated ${complaint.id} to ${status}.`);
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : "Could not update complaint status.");
+    } finally {
+      setAdminUpdatingId("");
+    }
+  }
+
+  useEffect(() => {
+    if (session?.user?.isAdmin && session?.token) {
+      refreshAdmin(session.token);
+    }
+  }, [session?.user?.isAdmin, session?.token]);
+
   return (
     <div className={`min-h-screen transition-colors ${theme === "dark" ? "bg-[#08111f] text-slate-100" : "bg-[#f5f7fb] text-slate-900"}`}>
       <div className="bg-mesh min-h-screen">
@@ -435,7 +567,10 @@ export function App() {
               {session ? <>
                 <button onClick={() => setTab(Tab.PROFILE)} className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 dark:border-white/10 dark:bg-white/5 dark:text-slate-100"><UserRound size={16} />{session.user.name}</button>
                 <button onClick={() => syncSession(null)} className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 dark:border-white/10 dark:bg-white/5 dark:text-slate-100"><LogOut size={16} />{t("logout", "Logout")}</button>
-              </> : <button onClick={() => openAuth("login")} className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white dark:bg-white dark:text-slate-900"><LogIn size={16} />{t("signIn", "Sign In")}</button>}
+              </> : <>
+                <button onClick={() => openAuth("login")} className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white dark:bg-white dark:text-slate-900"><LogIn size={16} />{t("signIn", "Sign In")}</button>
+                <button onClick={() => openAuth("login", "admin")} className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-700 dark:border-white/10 dark:bg-white/5 dark:text-slate-100"><Shield size={16} />Admin Login</button>
+              </>}
             </div>
           </div>
           <div className="mx-auto flex max-w-7xl flex-wrap gap-2 px-6 pb-4">
@@ -507,6 +642,58 @@ export function App() {
             <div className="glass rounded-[2rem] border border-white/60 p-6 dark:border-white/10"><p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400 dark:text-slate-400">Top categories</p><div className="mt-4 space-y-3">{categoryBoard.map(([category, count]) => <div key={category} className="flex items-center justify-between rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-700 dark:bg-white/5 dark:text-slate-200"><span>{category}</span><span className="font-bold">{count}</span></div>)}</div></div>
           </section> : null}
 
+          {tab === Tab.ASSISTANT ? <section className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+            <div className="glass rounded-[2rem] border border-white/60 p-6 dark:border-white/10">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400 dark:text-slate-400">{t("assistantTitle", "Civic assistant")}</p>
+              <h2 className="mt-2 text-3xl font-bold text-slate-900 dark:text-white">Solve simple civic issues yourself, safely</h2>
+              <div className="mt-5 space-y-3 max-h-[420px] overflow-auto pr-1">
+                {assistantMessages.map((message, index) => (
+                  <div key={`${message.role}-${index}`} className={`rounded-2xl px-4 py-3 text-sm leading-7 ${message.role === "user" ? "bg-slate-900 text-white dark:bg-white dark:text-slate-900" : "bg-white text-slate-700 dark:bg-white/5 dark:text-slate-100"}`}>
+                    {message.text}
+                  </div>
+                ))}
+                {assistantLoading ? <div className="inline-flex items-center gap-2 text-sm text-slate-500 dark:text-slate-300"><LoaderCircle size={16} className="animate-spin" />Thinking...</div> : null}
+              </div>
+              <div className="mt-5 flex gap-3">
+                <input
+                  value={assistantInput}
+                  onChange={(event) => setAssistantInput(event.target.value)}
+                  onKeyDown={(event) => event.key === "Enter" ? sendAssistantMessage() : null}
+                  placeholder={t("askPlaceholder", "Ask about routing, location details, or how to write a better complaint...")}
+                  className="flex-1 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-slate-900 outline-none dark:border-white/10 dark:bg-white/5 dark:text-white"
+                />
+                <button onClick={sendAssistantMessage} disabled={assistantLoading || !assistantInput.trim()} className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white disabled:opacity-70 dark:bg-white dark:text-slate-900">
+                  <Send size={16} />
+                  Send
+                </button>
+              </div>
+            </div>
+            <div className="glass rounded-[2rem] border border-white/60 p-6 dark:border-white/10">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400 dark:text-slate-400">What this assistant can do</p>
+              <div className="mt-4 space-y-3 text-sm text-slate-600 dark:text-slate-300">
+                <p className="rounded-2xl bg-white/80 p-4 dark:bg-white/5"><Sparkles size={15} className="mr-2 inline" />Share easy first-aid steps for common neighborhood problems.</p>
+                <p className="rounded-2xl bg-white/80 p-4 dark:bg-white/5"><Sparkles size={15} className="mr-2 inline" />Suggest when to escalate to municipal teams with exact details.</p>
+                <p className="rounded-2xl bg-white/80 p-4 dark:bg-white/5"><Sparkles size={15} className="mr-2 inline" />Help draft a strong complaint when self-resolution is not enough.</p>
+              </div>
+            </div>
+          </section> : null}
+
+          {tab === Tab.ADMIN ? (
+            session?.user?.isAdmin ? (
+              <AdminPanel
+                data={adminOverview}
+                loading={adminLoading}
+                updatingId={adminUpdatingId}
+                onStatusChange={updateAdminComplaintStatus}
+              />
+            ) : (
+              <section className="glass rounded-[2rem] border border-white/60 p-8 text-center dark:border-white/10">
+                <h2 className="text-3xl font-bold text-slate-900 dark:text-white">Admin access</h2>
+                <p className="mt-3 text-sm leading-7 text-slate-600 dark:text-slate-300">This area is restricted to admin accounts.</p>
+              </section>
+            )
+          ) : null}
+
           {tab === Tab.PROFILE ? (
             session ? (
               <ProfilePanel
@@ -534,7 +721,21 @@ export function App() {
         </main>
       </div>
 
-      <AuthModal open={authOpen} mode={authMode} loading={authLoading} error={authError} values={authFields} strings={strings} onClose={() => setAuthOpen(false)} onModeChange={setAuthMode} onFieldChange={(field, value) => setAuthFields((current) => ({ ...current, [field]: value }))} onSubmit={submitAuth} />
+      <AuthModal
+        open={authOpen}
+        mode={authMode}
+        loading={authLoading}
+        error={authError}
+        values={authFields}
+        strings={strings}
+        forgotHint={forgotOtpHint}
+        forgotDevOtp={forgotDevOtp}
+        onClose={() => setAuthOpen(false)}
+        onModeChange={handleAuthModeChange}
+        onFieldChange={(field, value) => setAuthFields((current) => ({ ...current, [field]: value }))}
+        onForgotOtpRequest={requestForgotOtp}
+        onSubmit={submitAuth}
+      />
     </div>
   );
 }

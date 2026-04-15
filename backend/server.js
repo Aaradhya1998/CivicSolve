@@ -29,7 +29,8 @@ const io = new Server(server, {
 });
 
 const port = Number(process.env.PORT || 5000);
-const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const model = String(process.env.GEMINI_MODEL || "gemini-2.5-flash").trim() || "gemini-2.5-flash";
+const fallbackModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"];
 const jwtSecret = process.env.JWT_SECRET || "civicsolve-local-secret";
 const passwordPepper = String(process.env.PASSWORD_PEPPER || "");
 const passwordRounds = Math.min(14, Math.max(10, Number(process.env.BCRYPT_ROUNDS || 12)));
@@ -54,6 +55,15 @@ const twilioConfigured = Boolean(
 );
 const otpDevFallback = String(process.env.OTP_DEV_FALLBACK || "true").trim().toLowerCase() === "true";
 const otpFallbackEnabled = otpDevFallback || process.env.NODE_ENV !== "production";
+const defaultAdminEmail = String(process.env.ADMIN_LOGIN_EMAIL || "devself200@gmail.com").trim().toLowerCase();
+const defaultAdminPassword = String(process.env.ADMIN_LOGIN_PASSWORD || "Thebubble3020");
+const adminEmails = new Set(
+  [...String(process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean), defaultAdminEmail]
+    .filter(Boolean)
+);
 
 const mailTransport = smtpConfigured
   ? nodemailer.createTransport({
@@ -189,6 +199,39 @@ function getClient() {
   return new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY,
   });
+}
+
+function getErrorText(error) {
+  if (error instanceof Error) return error.message || "";
+  return String(error || "");
+}
+
+function isMissingModelError(error) {
+  const message = getErrorText(error).toLowerCase();
+  return message.includes("is not found") || message.includes("not supported for generatecontent");
+}
+
+async function generateText(prompt) {
+  const ai = getClient();
+  const modelsToTry = [...new Set([model, ...fallbackModels])];
+  let lastError = null;
+
+  for (const candidate of modelsToTry) {
+    try {
+      const response = await ai.models.generateContent({
+        model: candidate,
+        contents: prompt,
+      });
+      return { text: response.text ?? "", model: candidate };
+    } catch (error) {
+      lastError = error;
+      if (!isMissingModelError(error)) {
+        break;
+      }
+    }
+  }
+
+  throw lastError || new Error("Could not generate content.");
 }
 
 function isBcryptHash(value) {
@@ -544,6 +587,17 @@ function normalizePhone(phone) {
   return String(phone || "").replace(/[^\d+]/g, "").trim();
 }
 
+function isAdminUser(user) {
+  return adminEmails.has(String(user?.email || "").trim().toLowerCase());
+}
+
+function isDefaultAdminLogin(identifier, password) {
+  return (
+    String(identifier || "").trim().toLowerCase() === defaultAdminEmail &&
+    String(password || "") === defaultAdminPassword
+  );
+}
+
 function getMonthKey(date) {
   const value = new Date(date);
   return `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, "0")}`;
@@ -625,17 +679,26 @@ function maskTarget(channel, value) {
   return `${name.slice(0, 2)}***@${domain}`;
 }
 
-async function sendOtp(channel, target, code, expiresAt) {
+async function sendOtp(channel, target, code, expiresAt, options = {}) {
   const deliveryHint = maskTarget(channel, target);
+  const purpose = String(options.purpose || "verification").trim().toLowerCase();
+  const isPasswordReset = purpose === "password_reset";
+  const emailSubject = isPasswordReset
+    ? process.env.PASSWORD_RESET_EMAIL_SUBJECT || "Your CivicSolve password reset code"
+    : process.env.OTP_EMAIL_SUBJECT || "Your CivicSolve verification code";
+  const emailText = isPasswordReset
+    ? `Your CivicSolve password reset code is ${code}. It expires at ${expiresAt}.`
+    : `Your CivicSolve verification code is ${code}. It expires at ${expiresAt}.`;
+  const emailHeading = isPasswordReset ? "CivicSolve Password Reset" : "CivicSolve Verification";
 
   if (channel === "email" && mailTransport) {
     try {
       await mailTransport.sendMail({
         from: smtpFrom,
         to: target,
-        subject: process.env.OTP_EMAIL_SUBJECT || "Your CivicSolve verification code",
-        text: `Your CivicSolve verification code is ${code}. It expires at ${expiresAt}.`,
-        html: `<div style="font-family:Arial,sans-serif;line-height:1.5"><h2>CivicSolve Verification</h2><p>Your verification code is <strong>${code}</strong>.</p><p>This code expires at ${expiresAt}.</p></div>`,
+        subject: emailSubject,
+        text: emailText,
+        html: `<div style="font-family:Arial,sans-serif;line-height:1.5"><h2>${emailHeading}</h2><p>Your code is <strong>${code}</strong>.</p><p>This code expires at ${expiresAt}.</p></div>`,
       });
 
       return {
@@ -692,7 +755,7 @@ async function sendOtp(channel, target, code, expiresAt) {
   );
 }
 
-async function issueOtpChallenge(user, channel) {
+async function issueOtpChallenge(user, channel, purpose = "verification") {
   const target = getOtpTarget(user, channel);
   const code = String(randomInt(100000, 999999));
   const now = new Date();
@@ -714,7 +777,7 @@ async function issueOtpChallenge(user, channel) {
     usedAt: "",
   });
 
-  return sendOtp(channel, target, code, expiresAt);
+  return sendOtp(channel, target, code, expiresAt, { purpose });
 }
 
 function getPublicUser(user) {
@@ -728,6 +791,7 @@ function getPublicUser(user) {
     lastLoginAt: user.lastLoginAt || "",
     emailVerified: Boolean(user.emailVerified),
     phoneVerified: Boolean(user.phoneVerified),
+    isAdmin: isAdminUser(user),
   };
 }
 
@@ -809,6 +873,13 @@ async function authMiddleware(req, res, next) {
   } catch {
     return res.status(401).json({ error: "Invalid session." });
   }
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user || !isAdminUser(req.user)) {
+    return res.status(403).json({ error: "Admin access required." });
+  }
+  next();
 }
 
 function broadcastComplaint(type, complaint) {
@@ -905,6 +976,40 @@ app.post("/api/auth/login", async (req, res) => {
   const identifier = String(req.body?.identifier || req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
   const normalizedIdentifier = normalizePhone(identifier);
+  const now = new Date().toISOString();
+
+  if (isDefaultAdminLogin(identifier, password)) {
+    let adminUser = db.data.users.find((entry) => entry.email === defaultAdminEmail);
+
+    if (!adminUser) {
+      adminUser = {
+        id: randomUUID(),
+        authId: "",
+        name: "Platform Admin",
+        email: defaultAdminEmail,
+        phone: "",
+        passwordHash: "",
+        language: "en",
+        createdAt: now,
+        lastLoginAt: now,
+        emailVerified: true,
+        phoneVerified: false,
+      };
+      db.data.users.push(adminUser);
+    } else {
+      adminUser.lastLoginAt = now;
+      adminUser.emailVerified = true;
+      adminUser.language = normalizeLanguage(adminUser.language || "en");
+      if (!adminUser.name) adminUser.name = "Platform Admin";
+    }
+
+    await persistData();
+    return res.json({
+      token: createToken(adminUser),
+      user: getPublicUser(adminUser),
+      message: "Signed in as admin.",
+    });
+  }
 
   if (supabase) {
     let email = identifier;
@@ -953,6 +1058,82 @@ app.post("/api/auth/login", async (req, res) => {
   user.lastLoginAt = new Date().toISOString();
   await persistData();
   return res.json({ token: createToken(user), user: getPublicUser(user) });
+});
+
+app.post("/api/auth/forgot-password/request", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const masked = maskTarget("email", email);
+
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ error: "A valid email is required." });
+  }
+
+  const user = db.data.users.find((entry) => entry.email === email);
+  if (!user) {
+    return res.json({
+      ok: true,
+      channel: "email",
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      deliveryHint: masked,
+      demoMode: false,
+    });
+  }
+
+  try {
+    const delivery = await issueOtpChallenge(user, "email", "password_reset");
+    await persistData();
+    return res.json(delivery);
+  } catch (error) {
+    db.data.otpChallenges = db.data.otpChallenges.filter(
+      (entry) => !(entry.userId === user.id && entry.channel === "email" && !entry.usedAt)
+    );
+    await persistData();
+    return res.status(400).json({
+      error: error instanceof Error ? error.message : "Could not send reset OTP.",
+    });
+  }
+});
+
+app.post("/api/auth/forgot-password/reset", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const code = String(req.body?.code || "").trim();
+  const nextPassword = String(req.body?.newPassword || "").trim();
+
+  if (!email || !email.includes("@") || !code || nextPassword.length < 6) {
+    return res.status(400).json({ error: "Email, OTP code, and new password (min 6 chars) are required." });
+  }
+
+  const user = db.data.users.find((entry) => entry.email === email);
+  if (!user) {
+    return res.status(400).json({ error: "Invalid or expired reset code." });
+  }
+
+  const challenge = [...db.data.otpChallenges]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.userId === user.id &&
+        entry.channel === "email" &&
+        !entry.usedAt &&
+        new Date(entry.expiresAt).getTime() > Date.now()
+    );
+
+  if (!challenge) {
+    return res.status(400).json({ error: "No active reset OTP found. Request a new code." });
+  }
+
+  const isValid = await bcrypt.compare(code, challenge.codeHash);
+  if (!isValid) {
+    return res.status(400).json({ error: "Invalid reset OTP code." });
+  }
+
+  challenge.usedAt = new Date().toISOString();
+  user.passwordHash = await hashPassword(nextPassword);
+  user.lastLoginAt = new Date().toISOString();
+  user.emailVerified = true;
+  await persistData();
+
+  return res.json({ ok: true, message: "Password reset successful. Sign in with your new password." });
 });
 
 app.get("/api/auth/me", authMiddleware, (req, res) => {
@@ -1147,6 +1328,67 @@ app.post("/api/complaints/:id/support", authMiddleware, async (req, res) => {
   return res.json({ complaint });
 });
 
+app.get("/api/admin/overview", authMiddleware, requireAdmin, (_req, res) => {
+  const complaints = [...db.data.complaints].sort((left, right) => right.reportedAt.localeCompare(left.reportedAt));
+  const resolved = complaints.filter((item) => item.status === "Resolved").length;
+  const withPhoto = complaints.filter((item) => Boolean(item.imageDataUrl)).length;
+  const mapped = complaints.filter(
+    (item) => typeof item.latitude === "number" && typeof item.longitude === "number"
+  ).length;
+  const byStatus = (["Submitted", "In Review", "Assigned", "Resolved"]).map((label) => ({
+    label,
+    count: complaints.filter((item) => item.status === label).length,
+  }));
+  const categoryCounts = complaints.reduce((accumulator, item) => {
+    accumulator[item.category] = (accumulator[item.category] || 0) + 1;
+    return accumulator;
+  }, {});
+  const byCategory = Object.entries(categoryCounts)
+    .map(([label, count]) => ({ label, count }))
+    .sort((left, right) => right.count - left.count);
+
+  return res.json({
+    totals: {
+      complaints: complaints.length,
+      resolved,
+      open: complaints.length - resolved,
+      withPhoto,
+      mapped,
+    },
+    byStatus,
+    byCategory,
+    complaints,
+  });
+});
+
+app.patch("/api/admin/complaints/:id/status", authMiddleware, requireAdmin, async (req, res) => {
+  const complaint = db.data.complaints.find((entry) => entry.id === req.params.id);
+  const nextStatus = String(req.body?.status || "").trim();
+  const allowedStatuses = new Set(["Submitted", "In Review", "Assigned", "Resolved"]);
+
+  if (!complaint) {
+    return res.status(404).json({ error: "Complaint not found." });
+  }
+
+  if (!allowedStatuses.has(nextStatus)) {
+    return res.status(400).json({ error: "Invalid complaint status." });
+  }
+
+  if (complaint.status !== nextStatus) {
+    complaint.status = nextStatus;
+    complaint.updatedAt = new Date().toISOString();
+    complaint.updates.unshift({
+      id: randomUUID(),
+      message: `Status updated to ${nextStatus} by admin.`,
+      createdAt: complaint.updatedAt,
+    });
+    await persistData();
+    broadcastComplaint("status-updated", complaint);
+  }
+
+  return res.json({ complaint });
+});
+
 app.post("/api/generate", async (req, res) => {
   try {
     const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
@@ -1154,13 +1396,9 @@ app.post("/api/generate", async (req, res) => {
       return res.status(400).json({ error: "Prompt is required." });
     }
 
-    const ai = getClient();
-    const response = await ai.models.generateContent({
-      model,
-      contents: prompt,
-    });
+    const response = await generateText(prompt);
 
-    return res.json({ text: response.text ?? "" });
+    return res.json({ text: response.text ?? "", model: response.model });
   } catch (error) {
     console.error(error);
     const status = process.env.GEMINI_API_KEY ? 500 : 503;
